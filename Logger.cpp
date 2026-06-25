@@ -4,7 +4,9 @@
 *           （2）使用了snprintf和vsnprintf来计算日志内容的长度，这可能会导致性能问题，尤其是在高频率的日志记录场景下。
 *               ===> 解决方案：可以使用固定大小的缓冲区来存储日志内容，避免频繁的内存分配和释放。
 *                               优先使用 C++ 的 std::string 和 RAII，避免手动内存管理。
-* 		    （3）还可以完善相关日志系统，添加删除旧日志文件等等，异步日志等等。
+*           （3）localtime 是非线程安全的标准 C 函数。strerror(errno) 同样内部使用全局静态字符串缓冲区，多线程调用会发生字符串覆盖，线程不安全，VS 标记废弃
+*               ===> 解决方案：替换为Windows编译器支持的安全函数 localtime_s，替换为安全函数 strerror_s 
+* 		    （4）还可以完善相关日志系统，添加删除旧日志文件等等，异步日志等等。
 * 
 */
 #include "Logger.h"
@@ -74,7 +76,12 @@ void Logger::log(Level level, const char* file, int line, const char* format, ..
     }
 
     time_t ticks = time(NULL);
-    struct tm* ptm = localtime(&ticks);
+    // struct tm* ptm = localtime(&ticks);
+	/*Windows 下 localtime_s 参数：(输出tm缓冲区, 输入time_t*)*/
+    struct tm tmbuf;
+    localtime_s(&tmbuf, &ticks);
+    struct tm* ptm = &tmbuf;
+	
     char timestamp[32];
     memset(timestamp, 0, sizeof(timestamp));
     strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", ptm);
@@ -132,14 +139,22 @@ void Logger::rotate()
 {
     close();
     time_t ticks = time(NULL);
-    struct tm* ptm = localtime(&ticks);
+    // struct tm* ptm = localtime(&ticks);
+	/*Windows 下 localtime_s 参数：(输出tm缓冲区, 输入time_t*)*/
+    struct tm tmbuf;
+	localtime_s(&tmbuf, &ticks);
+	struct tm* ptm = &tmbuf;
+	
     char timestamp[32];
     memset(timestamp, 0, sizeof(timestamp));
     strftime(timestamp, sizeof(timestamp), ".%Y-%m-%d_%H-%M-%S", ptm);
     std::string filename = m_filename + timestamp;
     if (rename(m_filename.c_str(), filename.c_str()) != 0)
     {
-        throw std::logic_error("rename log file failed: " + std::string(strerror(errno)));
+        // throw std::logic_error("rename log file failed: " + std::string(strerror(errno)));
+		char errBuf[128] = { 0 };
+		strerror_s(errBuf, sizeof(errBuf), errno);
+		throw std::logic_error("rename log file failed: " + std::string(errBuf));
     }
     open(m_filename);
 }

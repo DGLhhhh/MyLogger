@@ -1,18 +1,10 @@
-/*
-* 存在问题：（1）多线程不安全，多个线程同时调用 log() 方法可能会导致日志内容混乱。
-*               ===> 解决方案：可以使用互斥锁（mutex）来保护 log() 方法，确保同一时间只有一个线程可以写入日志。
-*           （2）使用了snprintf和vsnprintf来计算日志内容的长度，这可能会导致性能问题，尤其是在高频率的日志记录场景下。
-*               ===> 解决方案：可以使用固定大小的缓冲区来存储日志内容，避免频繁的内存分配和释放。
-*                               优先使用 C++ 的 std::string 和 RAII，避免手动内存管理。
-* 		    （3）还可以完善相关日志系统，添加删除旧日志文件等等，异步日志等等。
-* 
-*/
 #include "Logger.h"
 #include <time.h>
 #include <stdarg.h>
 #include <string.h>
 #include <errno.h>
 #include <stdexcept>
+
 using namespace yanlong::utility;
 
 const char* Logger::s_level[LEVEL_COUNT] =
@@ -44,58 +36,82 @@ Logger* Logger::instance()
 
 void Logger::open(const std::string& filename)
 {
+    // 加锁保护
+    std::lock_guard<std::mutex> lock(m_mutex);
+
     m_filename = filename;
     m_fout.open(filename, std::ios::app);
     if (m_fout.fail())
     {
         throw std::logic_error("open log file failed: " + filename);
     }
-	// seekp() 设置写入位置的偏移量，std::ios::end 表示从文件末尾开始计算偏移量
     m_fout.seekp(0, std::ios::end);
-	// tellp() 返回当前写入位置的偏移量，即文件的长度
-    m_len = m_fout.tellp();
+    m_len = static_cast<int>(m_fout.tellp());
 }
 
 void Logger::close()
 {
-    m_fout.close();
+    std::lock_guard<std::mutex> lock(m_mutex);
+    if (m_fout.is_open())
+    {
+        m_fout.close();
+    }
 }
 
 void Logger::log(Level level, const char* file, int line, const char* format, ...)
 {
+    // 检查日志级别
     if (m_level > level)
     {
         return;
     }
+
+    // 加锁保护整个日志写入过程
+    std::lock_guard<std::mutex> lock(m_mutex);
 
     if (m_fout.fail())
     {
         throw std::logic_error("open log file failed: " + m_filename);
     }
 
+    // 获取时间戳
     time_t ticks = time(NULL);
-    struct tm* ptm = localtime(&ticks);
+    struct tm tmbuf;
+    localtime_s(&tmbuf, &ticks);
+    struct tm* ptm = &tmbuf;
+
     char timestamp[32];
     memset(timestamp, 0, sizeof(timestamp));
     strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", ptm);
 
+
+    // 安全地获取级别字符串
+    const char* levelStr = "UNKNOWN";
+    if (level >= 0 && level < LEVEL_COUNT)
+    {
+        levelStr = s_level[level];
+    }
+
+    // 写入日志前缀
     int len = 0;
     const char* fmt = "%s %s %s:%d ";
-    len = snprintf(NULL, 0, fmt, timestamp, s_level[level], file, line);
+    len = snprintf(NULL, 0, fmt, timestamp, levelStr, file, line);
     if (len > 0)
     {
         char* buffer = new char[len + 1];
-        snprintf(buffer, len + 1, fmt, timestamp, s_level[level], file, line);
-        buffer[len] = 0;
+        snprintf(buffer, len + 1, fmt, timestamp, levelStr, file, line);
+        buffer[len] = '\n';
         m_fout << buffer;
         delete[] buffer;
         m_len += len;
     }
 
+    // 写入日志内容
     va_list arg_ptr;
     va_start(arg_ptr, format);
     len = vsnprintf(NULL, 0, format, arg_ptr);
     va_end(arg_ptr);
+
     if (len > 0)
     {
         char* content = new char[len + 1];
@@ -109,37 +125,61 @@ void Logger::log(Level level, const char* file, int line, const char* format, ..
     }
 
     m_fout << "\n";
-	// flush 刷新缓冲区，确保日志流及时写入文件
     m_fout.flush();
 
+    // 检查是否需要轮转
     if (m_max > 0 && m_len >= m_max)
     {
         rotate();
     }
 }
 
+void Logger::rotate()
+{
+    // 注意：rotate 在 log 函数中被调用，此时已经持有锁
+    // 不需要再次加锁，避免死锁
+
+    if (!m_fout.is_open())
+    {
+        return;
+    }
+
+    m_fout.close();
+
+    time_t ticks = time(NULL);
+    struct tm tmbuf;
+    localtime_s(&tmbuf, &ticks);
+    struct tm* ptm = &tmbuf;
+
+    char timestamp[32];
+    memset(timestamp, 0, sizeof(timestamp));
+    strftime(timestamp, sizeof(timestamp), ".%Y-%m-%d_%H-%M-%S", ptm);
+
+    std::string filename = m_filename + timestamp;
+    if (rename(m_filename.c_str(), filename.c_str()) != 0)
+    {
+        char errBuf[128] = { 0 };
+        strerror_s(errBuf, sizeof(errBuf), errno);
+        throw std::logic_error("rename log file failed: " + std::string(errBuf));
+    }
+
+    // 重新打开文件
+    m_fout.open(m_filename, std::ios::app);
+    if (m_fout.fail())
+    {
+        throw std::logic_error("open log file failed: " + m_filename);
+    }
+    m_len = 0;
+}
+
 void Logger::setMax(int bytes)
 {
+    std::lock_guard<std::mutex> lock(m_mutex);
     m_max = bytes;
 }
 
 void Logger::setLevel(int level)
 {
+    std::lock_guard<std::mutex> lock(m_mutex);
     m_level = level;
-}
-
-void Logger::rotate()
-{
-    close();
-    time_t ticks = time(NULL);
-    struct tm* ptm = localtime(&ticks);
-    char timestamp[32];
-    memset(timestamp, 0, sizeof(timestamp));
-    strftime(timestamp, sizeof(timestamp), ".%Y-%m-%d_%H-%M-%S", ptm);
-    std::string filename = m_filename + timestamp;
-    if (rename(m_filename.c_str(), filename.c_str()) != 0)
-    {
-        throw std::logic_error("rename log file failed: " + std::string(strerror(errno)));
-    }
-    open(m_filename);
 }
